@@ -8,24 +8,140 @@ import requests
 from requests.auth import HTTPBasicAuth
 import socket
 import time
+import subprocess
+import os
+import re
 
 app = Flask(__name__)
 CORS(app)
 
-management_ip = 'IP'
+management_ip = 'ip'
 username = 'admin'
-password = '*****'
+password = 'pass'
 
 base_url = f'https://{management_ip}/api'
 endpoint = '/network/ip/interfaces'
 url = base_url + endpoint
 
+# Can be updated to OpenStack REST API in future
+def set_environment_variables():
+    env_vars = dict(os.environ)
+    env_vars["OS_PROJECT_DOMAIN_ID"] = "default"
+    env_vars["OS_USER_DOMAIN_ID"] = "default"
+    env_vars["OS_AUTH_URL"] = "http://ip/identity"
+    env_vars["OS_PROJECT_NAME"] = "admin"
+    env_vars["OS_USERNAME"] = "admin"
+    env_vars["OS_PASSWORD"] = "pass"
+    return env_vars
+
+
+def run_command(command, env_vars=None):
+    result = subprocess.run(command, shell=True, env=env_vars, executable="/bin/bash", capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def convert_image(full_path, source_image, destination_image, env_vars):
+    command = "cd " + full_path + "; qemu-img convert -f vmdk -O qcow2 " + source_image + " " + destination_image
+    print(command)
+    return run_command(command, env_vars)
+
+def get_pool_name(ip, env_vars):
+    pool_command = f"cinder get-pools | grep {ip} | awk '{{print $4}}'"
+    return run_command(pool_command, env_vars)
+
+
+def get_source_path_from_nfs_shares(nfs_shares, env_vars):
+    source_path_cmd = "mount | grep -f "+ nfs_shares + " | awk '{print $3}'"
+    return run_command(source_path_cmd, env_vars)
+
+def get_source_backend_name(ip, nfs_shares, env_vars):
+    source_backend_command = f"cat " + nfs_shares +" | grep "+ ip +" | awk '{{print $1}}'"
+    return run_command(source_backend_command, env_vars)
+
+def manage_volume(pool_name, actual_file, volume_name, env_vars):
+    manage_command = f"cinder manage --id-type source-name {pool_name} {actual_file} --name {volume_name} --bootable"
+    manage_output = run_command(manage_command, env_vars)
+    id_match = re.search(r"\| id\s+\|\s+([\w-]+)\s+\|", manage_output)
+    if id_match:
+        volume_id = id_match.group(1)
+        print(volume_id)
+    else:
+        print("Volume ID not found in the output.")
+    return volume_id
+
+def resize_volume(full_path, destination_image, volume_id, env_vars):
+    virtual_size_command = "cd " + full_path + "; qemu-img info " + destination_image + " | grep virtual | awk '{print $3}'"
+    virtual_size = run_command(virtual_size_command, env_vars)
+    cinder_resize_command = "openstack volume set --size " + virtual_size + " " + volume_id
+    return run_command(cinder_resize_command, env_vars)
+
+def create_vm(vm_name, volume_id, env_vars):
+    vm_create_command = "nova boot --flavor d4 --boot-volume " + volume_id + " --nic net-id=0e08ba5f-1c5b-4069-a8b9-e86f7c34a736 " + vm_name
+    vm_create_output = run_command(vm_create_command, env_vars)
+    vm_id = ""
+    id_match = re.search(r"\| id\s+\|\s+([\w-]+)\s+\|", vm_create_output)
+    if id_match:
+        vm_id = id_match.group(1)
+    else:
+        print("VM ID not found in the output.")
+    time.sleep(15)
+    return vm_id
+
+def create_floating_ip(floating_ip_address, public_network_id, env_vars):
+    ip_create_command = "openstack floating ip create " + public_network_id + " --floating-ip-address " + floating_ip_address
+    return run_command(ip_create_command, env_vars)
+
+def assign_floating_ip_to_vm(vm_id, floating_ip_address, env_vars):
+    ip_assign_command = "openstack server add floating ip " + vm_id + " " + floating_ip_address
+    return run_command(ip_assign_command, env_vars)
+
+def migrate_to_open_stack(source_image, ip, vm_name):
+    env_vars = set_environment_variables()
+    print(env_vars)
+
+    subprocess.run(["ls", "-l"])
+    subprocess.run(['cinder list'], shell=True, env=env_vars, executable="/bin/bash")
+    #vm_name = "Ubuntu_vm_sai"
+    #vm_name = vm_name
+    volume_name = "hack_new_vol1"
+    floating_ip_address = "ip"
+    public_network_id = "fae6935c-0bbf-49f3-86a9-be20a26220be"
+
+    destination_image = source_image.replace(".vmdk", ".qcow2")
+    nfs_shares = "/etc/cinder/nfs_shares1"
+    source_path = get_source_path_from_nfs_shares(nfs_shares, env_vars)
+
+    convert_image(source_path, source_image, destination_image, env_vars)
+
+    pool_name = get_pool_name(ip, env_vars)
+    print(pool_name)
+
+    source_backend_name = get_source_backend_name(ip, nfs_shares, env_vars)
+    print(source_backend_name)
+
+    actual_file = f"{source_backend_name}/{destination_image}"
+    print(actual_file)
+
+    volume_id = manage_volume(pool_name, actual_file, volume_name, env_vars)
+
+    resize_volume(source_path, destination_image, volume_id, env_vars)
+
+    vm_id = create_vm(vm_name, volume_id, env_vars)
+
+    create_floating_ip(floating_ip_address, public_network_id, env_vars)
+
+    assign_floating_ip_to_vm(vm_id, floating_ip_address, env_vars)
+
+
 def resolve_hostname(hostname):
     try:
-        return socket.gethostbyname(hostname)
+        remote_ip = socket.gethostbyname(hostname)
+        print(f"Remote IP: {remote_ip}")
+        return remote_ip
     except socket.gaierror:
         print(f"Failed to resolve hostname: {hostname}")
         return None
+
 
 def get_vserver_name_from_data_ip(data_ip):
     resolved_ip = resolve_hostname(data_ip) if not data_ip.replace('.', '').isdigit() else data_ip
@@ -51,6 +167,7 @@ def get_vserver_name_from_data_ip(data_ip):
         print(response.text)
     return None
 
+
 def get_volume_details(vserver_name, volume_name):
     volume_endpoint = f"/storage/volumes?svm.name={vserver_name}&name={volume_name}"
     volume_url = base_url + volume_endpoint
@@ -66,6 +183,7 @@ def get_volume_details(vserver_name, volume_name):
         print(f"Failed to retrieve volume details: {response.status_code}")
         print(response.text)
     return None
+
 
 def create_file_clone(vserver_name, volume_name, volume_uuid, source_path, destination_path):
     clone_endpoint = "/storage/file/clone"
@@ -88,6 +206,7 @@ def create_file_clone(vserver_name, volume_name, volume_uuid, source_path, desti
         print(f"Failed to create file clone: {response.status_code}")
         print(response.text)
     return None
+
 
 def poll_job_status(job_uuid, timeout=60, interval=5):
     job_url = f"{base_url}/cluster/jobs/{job_uuid}"
@@ -112,6 +231,7 @@ def poll_job_status(job_uuid, timeout=60, interval=5):
     print(f"Job {job_uuid} did not complete within the timeout period")
     return None
 
+
 def clone_vmware_vmdk(data_ip, source_path, destination_path):
     vserver_name = get_vserver_name_from_data_ip(data_ip)
     if vserver_name:
@@ -121,11 +241,13 @@ def clone_vmware_vmdk(data_ip, source_path, destination_path):
         if volume_details:
             print(f"Volume Details for {volume_name} in vserver {vserver_name}:")
             print(volume_details)
-            job_uuid = create_file_clone(vserver_name, volume_name, volume_details['uuid'], source_path, destination_path)
+            job_uuid = create_file_clone(vserver_name, volume_name, volume_details['uuid'], source_path,
+                                         destination_path)
             if job_uuid:
                 poll_job_status(job_uuid, timeout=60, interval=5)
     else:
         print(f"Vserver Name for IP {data_ip} not found")
+
 
 def get_nfs_datastores(service_instance):
     content = service_instance.RetrieveContent()
@@ -147,6 +269,7 @@ def get_nfs_datastores(service_instance):
             }
             nfs_datastores.append(nfs_info)
     return nfs_datastores
+
 
 def get_vm_details(service_instance, datastores, vm_name):
     content = service_instance.RetrieveContent()
@@ -189,6 +312,7 @@ def get_vm_details(service_instance, datastores, vm_name):
             return vm_info
     return None
 
+
 def get_vm_files(datastore, vm):
     files = []
     browser = datastore.browser
@@ -219,6 +343,7 @@ def get_vm_files(datastore, vm):
 
     return files
 
+
 @app.route('/vm-details', methods=['GET'])
 def vm_details():
     vm_name = request.args.get('vm_name')
@@ -228,9 +353,9 @@ def vm_details():
     context = ssl._create_unverified_context()
 
     service_instance = SmartConnect(
-        host='esxi-ip',
+        host='esxi_ip',
         user='root',
-        pwd='esxi_pass',
+        pwd='pass',
         sslContext=context
     )
 
@@ -249,15 +374,21 @@ def vm_details():
                     first_vmdk_path = file['path'].split('] ')[1]
                     destination_vmdk_path = first_vmdk_path.replace('.vmdk', '_clone.vmdk')
                     break
-
+            remote_ip = resolve_hostname(remote_host) if not remote_host.replace('.', '').isdigit() else remote_host
+            vm_name = vm_info['name']
+            print(f"VM name: {vm_name}")
             print(f"Remote Host: {remote_host}")
+            print(f"Remote IP: {remote_ip}")
             print(f"First VMDK Path: {first_vmdk_path}")
+            print(f"Destination VMDK Path: {destination_vmdk_path}")
             clone_vmware_vmdk(remote_host, first_vmdk_path, destination_vmdk_path)
+            migrate_to_open_stack(destination_vmdk_path, remote_ip, vm_name)
             return jsonify(vm_info)
         else:
             return jsonify({"error": "VM not found"}), 404
     finally:
         Disconnect(service_instance)
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
